@@ -47,7 +47,7 @@ def train_for_export(seed: int = 42):
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=seed, stratify=y
     )
-    pipeline = build_svm_pipeline(C=10, gamma="scale")
+    pipeline = build_svm_pipeline(C=10, gamma=0.001)
     pipeline.fit(X_train, y_train)
 
     from sklearn.metrics import accuracy_score, recall_score
@@ -116,7 +116,7 @@ inline int classify(float body_temp, float resp_rate, float ambient_temp) {{
   return svm.predict(scaled);   // 0 = NORMAL, 1 = HEAT_STRESSED
 }}
 """
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         f.write(header)
     print(f"[micromlgen] Exported true SVM to '{output_path}'")
     return True

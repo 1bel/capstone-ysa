@@ -16,10 +16,17 @@ import argparse
 import joblib
 import pandas as pd
 
+from data_utils import validate_sensor_input
 from svm_model import FEATURE_COLUMNS
+
+# Trigger cooling at this confidence level rather than the default 0.5.
+# Lower threshold = more conservative = fewer missed heat-stress events.
+HEAT_STRESS_CONF_THRESHOLD = 0.4
 
 
 def predict_cooling_action(model, body_temp: float, resp_rate: float, ambient_temp: float):
+    validate_sensor_input(body_temp, resp_rate, ambient_temp)
+
     sample = pd.DataFrame(
         [[body_temp, resp_rate, ambient_temp]], columns=FEATURE_COLUMNS
     )
@@ -27,6 +34,10 @@ def predict_cooling_action(model, body_temp: float, resp_rate: float, ambient_te
     proba = None
     if hasattr(model, "predict_proba"):
         proba = model.predict_proba(sample)[0][1]  # probability of class "ON"
+        # Safety override: for heatstroke prevention, trigger at lower confidence.
+        # A false positive (unnecessary cooling) is far less harmful than a miss.
+        if proba >= HEAT_STRESS_CONF_THRESHOLD:
+            prediction = 1
 
     action = "TURN COOLING ON" if prediction == 1 else "KEEP COOLING OFF"
     return prediction, proba, action

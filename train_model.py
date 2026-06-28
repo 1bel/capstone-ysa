@@ -86,7 +86,7 @@ def main():
     print("[INFO] This runs 20 parameter combos x 5 folds = 100 fits. "
           "Progress will print below — this can take a minute or two, it is not frozen.")
     grid = GridSearchCV(
-        pipeline, param_grid, cv=5, scoring="f1", n_jobs=1, verbose=2
+        pipeline, param_grid, cv=5, scoring="recall", n_jobs=-1, verbose=2
     )
     grid.fit(X_train, y_train)
 
@@ -106,6 +106,12 @@ def main():
     print(confusion_matrix(y_test, y_pred))
     print("\nClassification Report:")
     print(classification_report(y_test, y_pred, target_names=["OFF (0)", "ON (1)"]))
+
+    # --- Train set check (compare with test to detect overfitting) ---------
+    y_train_pred = best_model.predict(X_train)
+    print(f"Train Accuracy: {accuracy_score(y_train, y_train_pred):.4f}  "
+          f"| Test Accuracy: {accuracy_score(y_test, y_pred):.4f}  "
+          f"(large gap = overfitting)")
 
     # --- Save model ----------------------------------------------------
     joblib.dump(best_model, args.output)

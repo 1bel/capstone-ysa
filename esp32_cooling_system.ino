@@ -7,52 +7,57 @@
  *
  * ── Hardware ─────────────────────────────────────────────────────────────
  *   ESP32 development board
- *   DS18B20  waterproof probe  → body temperature (attached to collar)
- *   DHT22    sensor            → ambient temperature
- *   Respiratory sensor         → breath detection (piezo/flex + signal
- *                                conditioning board outputs one digital
- *                                RISING pulse per breath cycle)
- *   2-channel relay module     → Channel 1: Peltier module
- *                                Channel 2: Cooling fans
+ *   DS18B20  waterproof probe   → body temperature  (GPIO4, OneWire)
+ *   DHT22    sensor             → ambient temperature (GPIO5)
+ *   Piezoelectric disc/film     → respiratory rate   (GPIO35 = ADC1_CH7)
  *
- * ── Required Arduino libraries (install via Library Manager) ─────────────
- *   • OneWire            by Paul Stoffregen
- *   • DallasTemperature  by Miles Burton
- *   • DHT sensor library by Adafruit
+ *   Piezo wiring (exactly as specified — no extra components except 1 MΩ):
  *
- * ── ML model file ────────────────────────────────────────────────────────
- *   Run  python export_model.py  in Python first, then copy the generated
- *   canine_model.h into THIS sketch's folder before compiling.
- *   That header exposes:  int classify(float body_temp,
- *                                      float resp_rate,
- *                                      float ambient_temp);
+ *       Piezo (+) ──────────────────── GPIO35
+ *                                         │
+ *                                      1 MΩ resistor   ← in parallel with piezo
+ *                                         │
+ *       Piezo (−) ──────────────────── GND
+ *
+ *   The 1 MΩ resistor holds GPIO35 at 0 V at rest and gives the piezo
+ *   charge a path to leak, so the baseline stays stable between breaths.
+ *
+ *   2-channel relay module      → Channel 1: Peltier module (GPIO25)
+ *                                  Channel 2: Cooling fans   (GPIO26)
+ *
+ * ── Required Arduino libraries (Library Manager) ──────────────────────────
+ *   OneWire            by Paul Stoffregen
+ *   DallasTemperature  by Miles Burton
+ *   DHT sensor library by Adafruit
+ *
+ * ── ML model header ───────────────────────────────────────────────────────
+ *   Run  python export_model.py  → copy canine_model.h into this folder.
  *
  * ── Cooling state machine ────────────────────────────────────────────────
  *
- *   NORMAL  ──(2+ sensors stressed)──►  HEAT_STRESSED
- *                                            │
- *                                  (all readings return to normal)
- *                                            │
- *                                            ▼
- *                                   COOLDOWN_PELTIER  (60 s)
- *                                   Peltier ON, Fan ON
- *                                   (holds temperature steady)
- *                                            │
- *                                    (60 s elapsed)
- *                                            │
- *                                            ▼
- *                                    COOLDOWN_FAN  (120 s)
- *                                    Peltier OFF, Fan ON
- *                                    (retains cold air, prevents
- *                                     rapid temperature shift)
- *                                            │
- *                                   (120 s elapsed)
- *                                            │
- *                                            ▼
- *                                         NORMAL
+ *   NORMAL ──(≥2 sensors stressed)──► HEAT_STRESSED
+ *                                          │
+ *                               (all readings return to normal)
+ *                                          │
+ *                                          ▼
+ *                                 COOLDOWN_PELTIER  [60 s]
+ *                                 Peltier ON, Fans ON
+ *                                 (holds temperature steady)
+ *                                          │
+ *                                  (60 s elapsed)
+ *                                          │
+ *                                          ▼
+ *                                  COOLDOWN_FAN  [120 s]
+ *                                  Peltier OFF, Fans ON
+ *                                  (retains cold air — prevents
+ *                                   rapid temperature shift / cardiac risk)
+ *                                          │
+ *                                 (120 s elapsed)
+ *                                          │
+ *                                          ▼
+ *                                       NORMAL
  *
- *   From any cooldown state, if heat stress is detected again,
- *   the system immediately returns to HEAT_STRESSED.
+ *   From any cooldown state, if stress is re-detected → HEAT_STRESSED (reset).
  */
 
 #include <OneWire.h>
@@ -60,7 +65,86 @@
 #include <DHT.h>
 #include "canine_model.h"   // generated by export_model.py
 
-// ── State machine ─────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+//  CONFIGURATION  —  adjust these to match your hardware
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Pin assignments ───────────────────────────────────────────────────────
+#define DS18B20_PIN        4
+#define DHT_PIN            5
+#define DHT_TYPE           DHT22
+#define RESP_ADC_PIN       35   // GPIO35 = ADC1_CH7  (input-only, ADC-capable)
+#define PELTIER_RELAY_PIN  25
+#define FAN_RELAY_PIN      26
+#define STATUS_LED_PIN     2    // built-in LED: ON = cooling active
+
+// ── Relay polarity ────────────────────────────────────────────────────────
+// Most relay modules are ACTIVE LOW (LOW = coil energised = ON).
+// If yours is active-HIGH, swap the two values below.
+#define RELAY_ON   LOW
+#define RELAY_OFF  HIGH
+
+// ── Cooling timers ────────────────────────────────────────────────────────
+#define PELTIER_HOLD_MS   60000UL   // keep Peltier ON 60 s after readings normalise
+#define FAN_HOLD_MS      120000UL   // keep fans ON 120 s after Peltier turns off
+#define SENSOR_SAMPLE_MS   2000UL   // body-temp + ambient sampled every 2 s
+
+// ── Respiratory rate — ADC peak detection ────────────────────────────────
+//
+//  GPIO35 is sampled at 50 Hz (every 20 ms) using analogRead().
+//  Each breath compresses the piezo → generates a positive voltage pulse.
+//  The 1 MΩ resistor drains the charge so the pin returns to 0 V between breaths.
+//  An EMA low-pass filter removes 50/60 Hz mains noise picked up by long wires.
+//  A rising-edge detector with hysteresis counts each breath peak.
+//
+//  RESP_MIN_PEAK_ADC  — noise gate (0–4095 scale).
+//    This is the most important tuning parameter.
+//    HOW TO TUNE:
+//      1. Uncomment  #define DEBUG_RESP_PLOTTER  below.
+//      2. Upload and open  Tools → Serial Plotter  (Ctrl+Shift+L).
+//      3. Place the piezo on the dog's chest (or breathe on it yourself).
+//      4. Note the peak values during breaths vs the noise at rest.
+//      5. Set RESP_MIN_PEAK_ADC ≈ 30 % of the breath-peak value.
+//         Example: peaks reach ADC = 800 at rest noise ≈ 60 → set to 240.
+//      6. Re-comment DEBUG_RESP_PLOTTER for normal operation.
+//
+#define RESP_MIN_PEAK_ADC   200     // default — tune per instructions above
+#define RESP_SAMPLE_MS       20UL   // ADC poll interval → 50 Hz
+#define RESP_REFRACTORY_MS  450UL   // min ms between peaks (guards ≤ 133 bpm max)
+#define RESP_MAX_INTERVAL  9000UL   // max plausible ms between breaths (≥ 6.7 bpm)
+#define RESP_HISTORY          8     // inter-breath intervals kept for BPM average
+
+// Uncomment to stream  filtered_ADC, threshold, threshold_low  to Serial Plotter.
+// Comment out for normal operation (also suppresses the sensor data table).
+// #define DEBUG_RESP_PLOTTER
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SENSOR OBJECTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+OneWire           oneWire(DS18B20_PIN);
+DallasTemperature bodyTempSensor(&oneWire);
+DHT               dht(DHT_PIN, DHT_TYPE);
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  RESPIRATORY ADC STATE  (private to sampleRespRate / getLatestRespRate)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static unsigned long _rLastSampleMs  = 0;
+static float         _rEMA           = 0.0f;     // EMA-filtered ADC value
+static int           _rRollingPeak   = RESP_MIN_PEAK_ADC; // adaptive peak tracker
+static uint8_t       _rDecayTick     = 0;        // controls rollingPeak decay rate
+static bool          _rPeakArmed     = true;     // true = ready to detect next peak
+static unsigned long _rLastBreathMs  = 0;        // 0 = no breath detected yet
+static unsigned long _rIntvl[RESP_HISTORY];      // ring buffer of inter-breath intervals (ms)
+static uint8_t       _rIdx           = 0;        // ring-buffer write pointer
+static uint8_t       _rCount         = 0;        // valid intervals stored (capped at RESP_HISTORY)
+static float         _rBPM           = 15.0f;    // cached result (default = mid-normal range)
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  COOLING STATE MACHINE
+// ═══════════════════════════════════════════════════════════════════════════
+
 enum CoolingState : uint8_t {
   STATE_NORMAL,
   STATE_HEAT_STRESSED,
@@ -68,64 +152,24 @@ enum CoolingState : uint8_t {
   STATE_COOLDOWN_FAN
 };
 
-const char* stateName(CoolingState s);
-
-// ── Pin assignments ───────────────────────────────────────────────────────
-#define DS18B20_PIN        4    // OneWire data (body temperature)
-#define DHT_PIN            5    // DHT22 data   (ambient temperature)
-#define DHT_TYPE           DHT22
-#define RESP_SENSOR_PIN    35   // Digital input from respiratory sensor
-                                // (GPIO35 is input-only on ESP32 — perfect here)
-#define PELTIER_RELAY_PIN  25   // Relay channel 1: Peltier module
-#define FAN_RELAY_PIN      26   // Relay channel 2: Cooling fans
-#define STATUS_LED_PIN     2    // Built-in LED (ON = cooling active)
-
-// ── Relay polarity ────────────────────────────────────────────────────────
-// Most 5V relay modules are ACTIVE LOW: signal LOW energises the coil (ON).
-// If your relay is active HIGH, swap the two lines below.
-#define RELAY_ON    LOW
-#define RELAY_OFF   HIGH
-
-// ── Timing ───────────────────────────────────────────────────────────────
-#define PELTIER_HOLD_MS   60000UL   // Peltier stays ON 60 s after readings normalise
-#define FAN_HOLD_MS      120000UL   // Fan stays ON 120 s after Peltier turns off
-#define SENSOR_SAMPLE_MS   2000UL   // Read all sensors every 2 s
-#define RESP_WINDOW_MS    15000UL   // Count breaths over a 15 s window, extrapolate to /min
-
-// ── Sensor objects ────────────────────────────────────────────────────────
-OneWire           oneWire(DS18B20_PIN);
-DallasTemperature bodyTempSensor(&oneWire);
-DHT               dht(DHT_PIN, DHT_TYPE);
-
-// ── Respiratory rate (interrupt-driven, non-blocking) ─────────────────────
-volatile uint16_t  breathCount     = 0;
-unsigned long      respWindowStart = 0;
-float              latestRespRate  = 15.0f;   // initial default: mid-normal range
-
-void IRAM_ATTR onBreath() {
-  breathCount++;
-}
-
-
+const char* stateName(CoolingState s);   // forward declaration
 
 CoolingState  coolingState   = STATE_NORMAL;
 unsigned long cooldownTimer  = 0;
 unsigned long lastSensorRead = 0;
 
-// ── Relay helpers ─────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+//  RELAY / LED HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+
 inline void setPeltier(bool on) { digitalWrite(PELTIER_RELAY_PIN, on ? RELAY_ON : RELAY_OFF); }
 inline void setFan    (bool on) { digitalWrite(FAN_RELAY_PIN,     on ? RELAY_ON : RELAY_OFF); }
 
 void activateCooling() {
-  setPeltier(true);
-  setFan(true);
-  digitalWrite(STATUS_LED_PIN, HIGH);
+  setPeltier(true); setFan(true); digitalWrite(STATUS_LED_PIN, HIGH);
 }
-
 void deactivateCooling() {
-  setPeltier(false);
-  setFan(false);
-  digitalWrite(STATUS_LED_PIN, LOW);
+  setPeltier(false); setFan(false); digitalWrite(STATUS_LED_PIN, LOW);
 }
 
 const char* stateName(CoolingState s) {
@@ -138,7 +182,126 @@ const char* stateName(CoolingState s) {
   }
 }
 
-// ── Sensor reads ──────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+//  RESPIRATORY RATE — ADC PEAK DETECTION
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Returns average of 4 raw ADC reads — reduces ESP32 ADC noise by ~50 %.
+static inline int adcAvg4() {
+  return (analogRead(RESP_ADC_PIN) + analogRead(RESP_ADC_PIN) +
+          analogRead(RESP_ADC_PIN) + analogRead(RESP_ADC_PIN)) >> 2;
+}
+
+/*
+ * sampleRespRate()
+ * ----------------
+ * Call this at the TOP of every loop() iteration.
+ * It polls the ADC at 50 Hz and runs a three-stage algorithm:
+ *
+ *  Stage 1 — EMA low-pass filter
+ *    Alpha = 0.25 → cutoff ≈ 2.5 Hz at 50 Hz sample rate.
+ *    Strongly attenuates 50/60 Hz mains interference from long wires
+ *    while passing breathing frequencies (0.17–1.07 Hz).
+ *
+ *  Stage 2 — Adaptive peak tracker
+ *    _rRollingPeak rises instantly to each new signal maximum.
+ *    It decays 1 ADC count every 8 samples (≈ 6 counts/s at 50 Hz;
+ *    half-life ≈ 14 s), keeping the threshold valid across slow breathing.
+ *    A floor at RESP_MIN_PEAK_ADC prevents it from collapsing to noise.
+ *
+ *  Stage 3 — Rising-edge breath detector with hysteresis
+ *    Threshold    = 35 % of _rRollingPeak  (or RESP_MIN_PEAK_ADC, whichever is larger)
+ *    Re-arm level = 50 % of threshold      (signal must fall here before next peak counts)
+ *
+ *    On each rising threshold crossing:
+ *      • If this is the very first breath: record the timestamp only.
+ *      • If gap ∈ [RESP_REFRACTORY_MS, RESP_MAX_INTERVAL]: valid breath.
+ *        Record gap in ring buffer; recalculate BPM from all stored intervals.
+ */
+void sampleRespRate() {
+  unsigned long now = millis();
+  if (now - _rLastSampleMs < RESP_SAMPLE_MS) return;
+  _rLastSampleMs = now;
+
+  // ── Stage 1: filter ───────────────────────────────────────────────────
+  int raw = adcAvg4();
+  _rEMA   = 0.25f * (float)raw + 0.75f * _rEMA;
+  int sig = (int)_rEMA;
+
+  // ── Stage 2: adaptive peak ────────────────────────────────────────────
+  if (sig > _rRollingPeak) {
+    _rRollingPeak = sig;                        // snap up immediately
+  } else {
+    if (++_rDecayTick >= 8) {                   // decay 1 count every 8 samples
+      _rDecayTick = 0;
+      _rRollingPeak--;
+    }
+    if (_rRollingPeak < RESP_MIN_PEAK_ADC)
+      _rRollingPeak = RESP_MIN_PEAK_ADC;
+  }
+
+  // ── Stage 3: rising-edge breath detection ─────────────────────────────
+  int thresh    = max(RESP_MIN_PEAK_ADC, (_rRollingPeak * 35) / 100);
+  int threshLow = thresh >> 1;                  // 50 % of thresh = re-arm level
+
+  if (_rPeakArmed && sig >= thresh) {
+
+    if (_rLastBreathMs == 0) {
+      // First breath ever — seed the timestamp, no interval to record yet.
+      _rLastBreathMs = now;
+
+    } else {
+      unsigned long gap = now - _rLastBreathMs;
+
+      if (gap >= RESP_REFRACTORY_MS && gap <= RESP_MAX_INTERVAL) {
+        // ── Valid breath interval ──────────────────────────────────────
+        _rIntvl[_rIdx % RESP_HISTORY] = gap;
+        _rIdx++;
+        if (_rCount < RESP_HISTORY) _rCount++;
+        _rLastBreathMs = now;
+
+        // Recalculate BPM from the average of all stored intervals.
+        // Requires ≥ 2 intervals for a meaningful result.
+        if (_rCount >= 2) {
+          unsigned long sum = 0;
+          for (int i = 0; i < (int)_rCount; i++) sum += _rIntvl[i];
+          _rBPM = 60000.0f / ((float)sum / (float)_rCount);
+        }
+
+      } else if (gap > RESP_MAX_INTERVAL) {
+        // Gap implausibly long (missed breath or sensor off) —
+        // reset timestamp so next interval is measured from this peak.
+        _rLastBreathMs = now;
+      }
+      // If gap < RESP_REFRACTORY_MS: noise bounce — ignore entirely.
+    }
+
+    _rPeakArmed = false;      // disarm; wait for signal to fall below threshLow
+
+  } else if (!_rPeakArmed && sig < threshLow) {
+    _rPeakArmed = true;       // signal returned to baseline — ready for next peak
+  }
+
+  // ── Serial Plotter debug output ───────────────────────────────────────
+#ifdef DEBUG_RESP_PLOTTER
+  // Open Tools → Serial Plotter (Ctrl+Shift+L) in Arduino IDE.
+  // Three traces: blue = filtered signal, red = threshold, green = re-arm level.
+  Serial.print(sig);      Serial.print(",");
+  Serial.print(thresh);   Serial.print(",");
+  Serial.println(threshLow);
+#endif
+}
+
+// Returns the most recently calculated respiratory rate in breaths/min.
+// Holds the last valid BPM; returns 15.0 (mid-normal) until 2 breaths detected.
+float getLatestRespRate() {
+  return _rBPM;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  TEMPERATURE SENSOR READS
+// ═══════════════════════════════════════════════════════════════════════════
+
 float readBodyTemp() {
   bodyTempSensor.requestTemperatures();
   float t = bodyTempSensor.getTempCByIndex(0);
@@ -150,22 +313,10 @@ float readAmbientTemp() {
   return isnan(t) ? -1.0f : t;
 }
 
-// Called every loop; only recalculates when the 15 s window expires.
-float getLatestRespRate() {
-  unsigned long now = millis();
-  if (now - respWindowStart >= RESP_WINDOW_MS) {
-    noInterrupts();
-    uint16_t count = breathCount;
-    breathCount    = 0;
-    interrupts();
-    // Extrapolate count over the window to a per-minute rate
-    latestRespRate = count * (60000.0f / (float)RESP_WINDOW_MS);
-    respWindowStart = now;
-  }
-  return latestRespRate;
-}
+// ═══════════════════════════════════════════════════════════════════════════
+//  COOLING STATE MACHINE UPDATE
+// ═══════════════════════════════════════════════════════════════════════════
 
-// ── State machine update ──────────────────────────────────────────────────
 void updateCoolingState(int isStressed, unsigned long now) {
   CoolingState prev = coolingState;
 
@@ -180,130 +331,141 @@ void updateCoolingState(int isStressed, unsigned long now) {
 
     case STATE_HEAT_STRESSED:
       if (!isStressed) {
-        // Readings returned to normal — start the peltier hold timer.
-        // Cooling hardware stays fully ON during this phase.
-        coolingState = STATE_COOLDOWN_PELTIER;
+        coolingState  = STATE_COOLDOWN_PELTIER;
         cooldownTimer = now;
+        // Peltier + fans stay ON — timer has started.
       }
       break;
 
     case STATE_COOLDOWN_PELTIER:
       if (isStressed) {
-        // Stress returned — abort cooldown, remain in full cooling mode.
         coolingState = STATE_HEAT_STRESSED;
-        // Peltier + fan are already ON; no relay change needed.
+        // Relays already ON — no hardware change needed.
       } else if (now - cooldownTimer >= PELTIER_HOLD_MS) {
-        // 60 s elapsed — turn off Peltier, keep fan running to retain cold air.
-        coolingState = STATE_COOLDOWN_FAN;
+        coolingState  = STATE_COOLDOWN_FAN;
         cooldownTimer = now;
-        setPeltier(false);
-        // Fan stays ON (setFan remains true from activateCooling)
+        setPeltier(false);    // Peltier OFF; fan stays ON
       }
       break;
 
     case STATE_COOLDOWN_FAN:
       if (isStressed) {
-        // Stress detected during fan cooldown — restart full cooling.
         coolingState = STATE_HEAT_STRESSED;
-        activateCooling();   // turns Peltier back on
+        activateCooling();    // Peltier back ON
       } else if (now - cooldownTimer >= FAN_HOLD_MS) {
-        // 120 s elapsed — full cooldown complete, return to idle.
         coolingState = STATE_NORMAL;
         deactivateCooling();
       }
       break;
   }
 
-  // Log state transitions to Serial Monitor
   if (coolingState != prev) {
-    Serial.printf("\n[STATE CHANGE] %s  →  %s\n", stateName(prev), stateName(coolingState));
+    Serial.printf("\n[STATE] %s  →  %s\n", stateName(prev), stateName(coolingState));
     switch (coolingState) {
       case STATE_HEAT_STRESSED:
-        Serial.println("  ACTION : Peltier ON + Fans ON");
+        Serial.println("  Peltier ON + Fans ON");
         break;
       case STATE_COOLDOWN_PELTIER:
-        Serial.printf("  ACTION : Readings normal. Peltier+Fans ON for %lu s (hold temp).\n",
+        Serial.printf("  Readings normal. Peltier+Fans ON for %lu s.\n",
                       PELTIER_HOLD_MS / 1000UL);
         break;
       case STATE_COOLDOWN_FAN:
-        Serial.printf("  ACTION : Peltier OFF. Fans ON for %lu s (retain cold, "
-                      "prevent rapid temp shift).\n", FAN_HOLD_MS / 1000UL);
+        Serial.printf("  Peltier OFF. Fans ON for %lu s (gradual warm-up).\n",
+                      FAN_HOLD_MS / 1000UL);
         break;
       case STATE_NORMAL:
-        Serial.println("  ACTION : Cooldown complete. System idle. All cooling OFF.");
+        Serial.println("  Cooldown complete. All cooling OFF.");
         break;
     }
   }
 }
 
-// ── Setup ─────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════════════════════════════════════
+
 void setup() {
   Serial.begin(115200);
   delay(500);
 
-  Serial.println("\n========================================");
-  Serial.println("  Canine Heat Stroke Prevention System  ");
-  Serial.println("========================================");
-  Serial.println("Initialising sensors and actuators...");
+  Serial.println(F("\n=========================================="));
+  Serial.println(F("  Canine Heat Stroke Prevention System  "));
+  Serial.println(F("=========================================="));
+  Serial.println(F("Initialising sensors and actuators..."));
 
+  // Actuator pins
   pinMode(PELTIER_RELAY_PIN, OUTPUT);
   pinMode(FAN_RELAY_PIN,     OUTPUT);
   pinMode(STATUS_LED_PIN,    OUTPUT);
-  deactivateCooling();   // safe default: everything OFF at boot
+  deactivateCooling();    // safe state at boot: everything OFF
 
+  // ADC setup for piezoelectric respiratory sensor on GPIO35.
+  // ADC_11db selects the full 0–3.3 V input range (12-bit = 0–4095).
+  // NOTE: newer Arduino-ESP32 core v3.x renamed this to ADC_ATTEN_DB_12.
+  //       If you get a compile error on ADC_11db, change it to ADC_ATTEN_DB_12.
+  analogSetWidth(12);
+  analogSetPinAttenuation(RESP_ADC_PIN, ADC_11db);
+
+  // Temperature sensors
   bodyTempSensor.begin();
   dht.begin();
 
-  // Attach interrupt for respiratory sensor (RISING edge = one breath detected)
-  attachInterrupt(digitalPinToInterrupt(RESP_SENSOR_PIN), onBreath, RISING);
-  respWindowStart = millis();
+  // Pre-fill ring buffer with a plausible mid-normal interval
+  // (2 000 ms = 30 bpm). Not used for BPM until _rCount >= 2.
+  for (int i = 0; i < RESP_HISTORY; i++) _rIntvl[i] = 2000;
 
-  Serial.println("Ready. Monitoring started.\n");
-  Serial.println("body_temp(C)  resp_rate(bpm)  ambient(C)  state                result         cooldown");
-  Serial.println("───────────────────────────────────────────────────────────────────────────────────────");
+  Serial.println(F("All sensors ready. Monitoring started.\n"));
+
+#ifndef DEBUG_RESP_PLOTTER
+  Serial.println(F("BodyTemp(C)  RespRate(bpm)  Ambient(C)  State                 Result         Cooldown"));
+  Serial.println(F("──────────────────────────────────────────────────────────────────────────────────────"));
+#else
+  Serial.println(F("[PLOTTER MODE] Traces: filtered_ADC | threshold | re-arm_level"));
+#endif
 }
 
-// ── Main loop ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+//  MAIN LOOP
+// ═══════════════════════════════════════════════════════════════════════════
+
 void loop() {
+  // ── Respiratory ADC sampled at 50 Hz on every iteration ──────────────────
+  // This must run unconditionally so the 20 ms poll stays accurate
+  // regardless of how long the 2-second sensor cycle takes.
+  sampleRespRate();
+
+  // ── 2-second body-temp / ambient / classification cycle ──────────────────
   unsigned long now = millis();
+  if (now - lastSensorRead < SENSOR_SAMPLE_MS) return;
+  lastSensorRead = now;
 
-  if (now - lastSensorRead >= SENSOR_SAMPLE_MS) {
-    lastSensorRead = now;
+  float bodyTemp    = readBodyTemp();
+  float ambientTemp = readAmbientTemp();
+  float respRate    = getLatestRespRate();   // returns cached BPM (no ADC call here)
 
-    float bodyTemp    = readBodyTemp();
-    float ambientTemp = readAmbientTemp();
-    float respRate    = getLatestRespRate();
-
-    // Sensor fault guard — skip this cycle if hardware reports invalid data
-    if (bodyTemp < 0.0f || ambientTemp < 0.0f) {
-      Serial.println("[WARN] Sensor read failed — check wiring. Skipping cycle.");
-      return;
-    }
-
-    // ML inference (from canine_model.h)
-    int prediction = classify(bodyTemp, respRate, ambientTemp);
-
-    updateCoolingState(prediction, now);
-
-    // ── Cooldown progress display ─────────────────────────────────────────
-    unsigned long elapsed = 0;
-    unsigned long target  = 0;
-    if (coolingState == STATE_COOLDOWN_PELTIER || coolingState == STATE_COOLDOWN_FAN) {
-      elapsed = (now - cooldownTimer) / 1000UL;
-      target  = (coolingState == STATE_COOLDOWN_PELTIER) ? PELTIER_HOLD_MS / 1000UL
-                                                         : FAN_HOLD_MS     / 1000UL;
-    }
-
-    // ── Serial monitor row ────────────────────────────────────────────────
-    char cooldownBuf[20] = "-";
-    if (target > 0) snprintf(cooldownBuf, sizeof(cooldownBuf), "%lus / %lus", elapsed, target);
-
-    Serial.printf("%-13.2f %-15.1f %-11.2f %-20s %-14s %s\n",
-                  bodyTemp,
-                  respRate,
-                  ambientTemp,
-                  stateName(coolingState),
-                  (prediction ? "HEAT_STRESSED" : "NORMAL"),
-                  cooldownBuf);
+  if (bodyTemp < 0.0f || ambientTemp < 0.0f) {
+    Serial.println(F("[WARN] Sensor read error — check wiring. Skipping cycle."));
+    return;
   }
+
+  int prediction = classify(bodyTemp, respRate, ambientTemp);
+  updateCoolingState(prediction, now);
+
+#ifndef DEBUG_RESP_PLOTTER
+  // Cooldown timer progress
+  unsigned long elapsed = 0, target = 0;
+  if (coolingState == STATE_COOLDOWN_PELTIER || coolingState == STATE_COOLDOWN_FAN) {
+    elapsed = (now - cooldownTimer) / 1000UL;
+    target  = (coolingState == STATE_COOLDOWN_PELTIER) ? PELTIER_HOLD_MS / 1000UL
+                                                       : FAN_HOLD_MS     / 1000UL;
+  }
+  char cdBuf[20] = "-";
+  if (target) snprintf(cdBuf, sizeof(cdBuf), "%lus / %lus", elapsed, target);
+
+  Serial.printf("%-12.2f %-14.1f %-11.2f %-21s %-14s %s\n",
+                bodyTemp, respRate, ambientTemp,
+                stateName(coolingState),
+                prediction ? "HEAT_STRESSED" : "NORMAL",
+                cdBuf);
+#endif
 }

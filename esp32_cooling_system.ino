@@ -78,7 +78,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 //  NETWORK CREDENTIALS  —  fill in your own
 // ═══════════════════════════════════════════════════════════════════════════
-const char* WIFI_SSID = "GALAXY A72AA03";
+const char* WIFI_SSID = "Galaxy A72AA03";
 const char* WIFI_PASS = "gddu5648";
 
 // Google Apps Script web-app URL for data logging to Google Sheets.
@@ -499,7 +499,11 @@ void loop() {
   float environmentalTemp = readenvironmentalTemp();
   float respRate    = getLatestRespRate();
 
-  Serial.printf("[DEBUG] Body: %.2f C | Environmental: %.2f C\n", bodyTemp, environmentalTemp);
+  // Update resp rate immediately — always pushed to Blynk V1 even if other sensors fail
+  g_respRate = respRate;
+
+  Serial.printf("[DEBUG] Body: %.2f C | Resp: %.1f bpm | Environmental: %.2f C\n",
+                bodyTemp, respRate, environmentalTemp);
 
   if (bodyTemp < 0.0f) {
     Serial.println(F("[WARN] DS18B20 returned -127C (disconnected / CRC fail)."));
@@ -512,9 +516,9 @@ void loop() {
   }
 
   // Update shared cache so Blynk/Sheets timers read fresh values
-  g_bodyTemp    = bodyTemp;
+  g_bodyTemp          = bodyTemp;
   g_environmentalTemp = environmentalTemp;
-  g_respRate    = respRate;
+  // g_respRate already updated above (before sensor checks)
 
   int prediction  = classify(bodyTemp, respRate, environmentalTemp);
   g_prediction    = prediction;

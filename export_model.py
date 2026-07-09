@@ -163,7 +163,7 @@ inline int classify(float body_temp, float resp_rate, float ambient_temp) {{
   return (stressed >= 2) ? 1 : 0;
 }}
 """
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         f.write(header)
     print(f"[export] Rule-based classifier written to '{output_path}'")
 

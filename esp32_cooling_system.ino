@@ -114,20 +114,24 @@ const char* SHEETS_URL = "https://script.google.com/macros/s/AKfycby5PRPnGOw_gBy
 // ═══════════════════════════════════════════════════════════════════════════
 //  RESPIRATORY RATE — ADC PEAK DETECTION
 // ═══════════════════════════════════════════════════════════════════════════
-//  GPIO35 is polled at 50 Hz. An EMA filter suppresses 50/60 Hz mains pickup
-//  from long wires; a rising-edge detector with hysteresis counts breath peaks.
+//  GPIO35 is polled at 50 Hz. Three-stage algorithm:
+//    1. EMA filter  — removes 50/60 Hz mains noise from long piezo wires
+//    2. Dynamic window — auto-tracks signal peak and floor; no manual tuning
+//    3. Median BPM  — ignores single outlier detections; no BPM spikes
 //
-//  RESP_MIN_PEAK_ADC calibration:
-//    1. Uncomment  #define DEBUG_RESP_PLOTTER
+//  RESP_MIN_RANGE_ADC calibration (Serial Plotter):
+//    1. Uncomment  #define DEBUG_RESP_PLOTTER  below
 //    2. Upload → open Serial Plotter (Ctrl+Shift+L)
-//    3. Place piezo on chest, note peak vs resting noise
-//    4. Set to ≈ 30 % of peak amplitude, recomment the define.
+//    3. Breathing normally with piezo on chest: watch sig vs thresh lines.
+//       - No detection triggering? Lower RESP_MIN_RANGE_ADC (more sensitive).
+//       - Noise triggering false peaks? Raise RESP_MIN_RANGE_ADC (less sensitive).
+//    4. Recomment the define when calibrated.
 //
-#define RESP_MIN_PEAK_ADC    200       // noise gate (0–4095); tune per above
+#define RESP_MIN_RANGE_ADC   50        // min peak-to-peak ADC counts to enable detection
 #define RESP_SAMPLE_MS        20UL     // ADC poll interval = 50 Hz
-#define RESP_REFRACTORY_MS  450UL     // min ms between detected peaks
-#define RESP_MAX_INTERVAL  9000UL     // max plausible ms per breath (≥ 6.7 bpm)
-#define RESP_HISTORY          8       // inter-breath intervals averaged for BPM
+#define RESP_REFRACTORY_MS  450UL     // min ms between detected peaks (~133 bpm max)
+#define RESP_MAX_INTERVAL  9000UL     // max plausible ms per breath (6.7 bpm min)
+#define RESP_HISTORY          6        // ring buffer size; median of last 6 intervals
 // #define DEBUG_RESP_PLOTTER            // uncomment for Serial Plotter calibration
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -142,8 +146,6 @@ DHT               dht(DHT_PIN, DHT_TYPE);
 // ═══════════════════════════════════════════════════════════════════════════
 static unsigned long _rLastSampleMs  = 0;
 static float         _rEMA           = 0.0f;
-static int           _rRollingPeak   = RESP_MIN_PEAK_ADC;
-static uint8_t       _rDecayTick     = 0;
 static bool          _rPeakArmed     = true;
 static unsigned long _rLastBreathMs  = 0;
 static unsigned long _rIntvl[RESP_HISTORY];
@@ -208,55 +210,77 @@ static inline int adcAvg4() {
 }
 
 // Call from top of loop() on every iteration (self-limits to 50 Hz internally).
+// Call from top of loop() on every iteration (self-limits to 50 Hz internally).
 void sampleRespRate() {
   unsigned long now = millis();
   if (now - _rLastSampleMs < RESP_SAMPLE_MS) return;
   _rLastSampleMs = now;
 
-  // Stage 1 — EMA low-pass filter (α=0.25, cutoff ≈ 2.5 Hz @ 50 Hz)
+  // Stage 1 - Raw ADC with light denoising (Trusting adcAvg4() for heavy lifting)
   int raw = adcAvg4();
-  _rEMA   = 0.25f * (float)raw + 0.75f * _rEMA;
-  int sig = (int)_rEMA;
+  // Raised alpha to 0.45 to prevent peak-flattening while stripping high frequency hum
+  _rEMA = 0.45f * (float)raw + 0.55f * _rEMA;
+  float sig = _rEMA;
 
-  // Stage 2 — Adaptive peak tracker (instant rise, slow decay)
-  if (sig > _rRollingPeak) {
-    _rRollingPeak = sig;
-  } else {
-    if (++_rDecayTick >= 8) { _rDecayTick = 0; _rRollingPeak--; }
-    if (_rRollingPeak < RESP_MIN_PEAK_ADC) _rRollingPeak = RESP_MIN_PEAK_ADC;
-  }
+  // Stage 2 - Slower Dynamic Window Decay (Lasts ~6-8 seconds instead of 1 second)
+  static float _dMax = 0.0f, _dMin = 4095.0f;
+  _dMax = _dMax * 0.9975f;
+  _dMin = _dMin * 1.0025f;
+  if (sig > _dMax) _dMax = sig;
+  if (sig < _dMin) _dMin = sig;
 
-  // Stage 3 — Rising-edge breath detection with hysteresis
-  int thresh    = max(RESP_MIN_PEAK_ADC, (_rRollingPeak * 35) / 100);
-  int threshLow = thresh >> 1;
+  // Stage 3 - Range guard
+  float range = _dMax - _dMin;
+  if (range < (float)RESP_MIN_RANGE_ADC) return;
 
+  float thresh    = _dMin + range * 0.60f; // Adjusted for better peak sensitivity
+  float threshLow = _dMin + range * 0.35f;
+
+  // Stage 4 - Rising-edge peak detection
   if (_rPeakArmed && sig >= thresh) {
-    if (_rLastBreathMs == 0) {
-      _rLastBreathMs = now;   // first breath: seed timestamp, no interval yet
-    } else {
+    if (_rLastBreathMs != 0) {
       unsigned long gap = now - _rLastBreathMs;
       if (gap >= RESP_REFRACTORY_MS && gap <= RESP_MAX_INTERVAL) {
+        
+        // Save interval to ring buffer
         _rIntvl[_rIdx % RESP_HISTORY] = gap;
         _rIdx++;
         if (_rCount < RESP_HISTORY) _rCount++;
-        _rLastBreathMs = now;
-        if (_rCount >= 2) {
-          unsigned long sum = 0;
-          for (int i = 0; i < (int)_rCount; i++) sum += _rIntvl[i];
-          _rBPM = 60000.0f / ((float)sum / (float)_rCount);
+
+        // Process BPM inside the true valid breath condition block
+        if (_rCount >= 3) {
+          // Stage 5 — Median filter calculation
+          unsigned long buf[RESP_HISTORY];
+          uint8_t n = _rCount;
+          for (uint8_t i = 0; i < n; i++) buf[i] = _rIntvl[i];
+          
+          for (int i = 1; i < (int)n; i++) { // Insertion sort
+            unsigned long key = buf[i];
+            int j = i - 1;
+            while (j >= 0 && buf[j] > key) { buf[j + 1] = buf[j]; j--; }
+            buf[j + 1] = key;
+          }
+          
+          unsigned long med = (n % 2 == 0)
+                              ? (buf[n / 2 - 1] + buf[n / 2]) / 2
+                              : buf[n / 2];
+          
+          float rawBPM = 60000.0f / (float)med;
+          _rBPM = _rBPM * 0.75f + rawBPM * 0.25f; 
         }
-      } else if (gap > RESP_MAX_INTERVAL) {
-        _rLastBreathMs = now;   // gap too long: reset anchor, don't record
       }
     }
-    _rPeakArmed = false;
+    // CRITICAL FIX: These variables must only reset when a peak event triggers
+    _rLastBreathMs = now;
+    _rPeakArmed = false; 
+
   } else if (!_rPeakArmed && sig < threshLow) {
-    _rPeakArmed = true;
+    _rPeakArmed = true;  // Re-arm when signal clears the baseline threshold
   }
 
 #ifdef DEBUG_RESP_PLOTTER
-  Serial.print(sig);    Serial.print(",");
-  Serial.print(thresh); Serial.print(",");
+  Serial.print(sig);      Serial.print(",");
+  Serial.print(thresh);   Serial.print(",");
   Serial.println(threshLow);
 #endif
 }
@@ -471,7 +495,7 @@ void setup() {
 #ifndef DEBUG_RESP_PLOTTER
   Serial.println(F("BodyTemp(C)  RespRate(bpm)  environmental(C)  State                 Result         Cooldown"));
   Serial.println(F("─────────────────────────────────────────────────────────────────────────────────────────────"));
-#else
+  #else
   Serial.println(F("[PLOTTER MODE] filtered_ADC | threshold | re-arm_level"));
 #endif
 }

@@ -14,7 +14,7 @@
 
 // ── Thresholds (Master Threshold Classification Table) ───────────────────
 static const float BODY_TEMP_HEAT_CUTOFF    = 39.5f;    // > this -> stressed
-static const float RESP_RATE_HEAT_LOWER     = 29.0f;   // >= this -> stressed (no upper cap)
+static const float RESP_RATE_HEAT_LOWER     = 200.0f;   // >= this -> stressed (no upper cap)
 static const float AMBIENT_TEMP_HEAT_CUTOFF = 30.0f;  // > this -> stressed
 
 // ── classify() ───────────────────────────────────────────────────────────

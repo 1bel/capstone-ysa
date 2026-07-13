@@ -25,10 +25,11 @@ import pandas as pd
 BODY_TEMP_NORMAL_RANGE = (38.3, 39.2)     # deg C
 BODY_TEMP_HEAT_CUTOFF  = 39.5             # > 39.5 -> heat-stressed
 
-RESP_RATE_NORMAL_RANGE = (10, 30)         # cycles/min
-RESP_RATE_HEAT_LOWER   = 29              # >= 29 -> heat-stressed; no upper cap:
-                                          # 64 in the table is the observed max,
-                                          # NOT a "safe above here" cutoff.
+RESP_RATE_NORMAL_RANGE = (50, 199)        # bpm (sensor composite signal, normal range)
+RESP_RATE_HEAT_LOWER   = 200             # >= 200 bpm -> heat-stressed (panting zone)
+                                          # Reflects piezoelectric sensor output (chest
+                                          # movement composite: respiratory + cardiac).
+                                          # Revised per Table 2 — Thesis.
 
 AMBIENT_TEMP_NORMAL_RANGE = (20, 30)      # deg C
 AMBIENT_TEMP_HEAT_CUTOFF  = 30            # > 30 -> heat-stressed
@@ -39,9 +40,9 @@ def is_body_temp_stressed(value: float) -> bool:
 
 
 def is_resp_rate_stressed(value: float) -> bool:
-    # Heat-stressed zone starts at >= 29 cycles/min per the threshold table.
-    # There is NO upper cap: a dog panting at 70+ cycles/min is still stressed.
-    # The table's upper value of 64 is the observed dataset max, not a ceiling.
+    # Heat-stressed zone starts at >= 200 bpm per revised Table 2.
+    # Reflects sensor composite signal (piezo on chest). No upper cap —
+    # 400 bpm severe panting is still counted as stressed.
     return value >= RESP_RATE_HEAT_LOWER
 
 
@@ -59,9 +60,9 @@ def validate_sensor_input(body_temp: float, resp_rate: float, ambient_temp: floa
         raise ValueError(
             f"Implausible body_temp={body_temp:.2f} C (expected 30-45)"
         )
-    if not (0 <= resp_rate <= 150):
+    if not (0 <= resp_rate <= 400):
         raise ValueError(
-            f"Implausible resp_rate={resp_rate:.1f} cycles/min (expected 0-150)"
+            f"Implausible resp_rate={resp_rate:.1f} bpm (expected 0-400; panting up to 400 bpm)"
         )
     if not (-10 <= ambient_temp <= 60):
         raise ValueError(
@@ -118,47 +119,49 @@ def generate_synthetic_dataset(n_samples: int = 4000, seed: int = 42) -> pd.Data
         "borderline":  int(n_samples * 0.10),  # only 1 sensor stressed -> label 0
     }
 
-    # Scenario 1 — Normal: cool environment, resting dog
+    # Scenario 1 — Normal: cool environment, dog at rest or walking
+    # Resp 50-199 bpm = sensor normal range below the 200 bpm stress threshold
     s1 = make_scenario(
         counts["normal"], (20, 30),
         lambda a, rng: rng.uniform(38.3, 39.2, len(a)) + rng.normal(0, 0.1, len(a)),
-        lambda a, b, rng: rng.uniform(10, 28, len(a)) + rng.normal(0, 1.5, len(a)),
+        lambda a, b, rng: rng.uniform(50, 199, len(a)) + rng.normal(0, 5.0, len(a)),
     )
 
-    # Scenario 2 — Full heat stress: hot environment drives up all three sensors
+    # Scenario 2 — Full heat stress: hot environment, all three sensors stressed
+    # Resp >= 200 bpm = panting zone (>= 200 threshold, Table 2 revised)
     s2 = make_scenario(
         counts["full_stress"], (30.5, 40),
         lambda a, rng: 39.6 + (a - 30.5) * 0.12 + rng.normal(0, 0.2, len(a)),
-        lambda a, b, rng: 29 + (a - 30.5) * 1.5  + rng.normal(0, 3.0, len(a)),
+        lambda a, b, rng: 200 + (a - 30.5) * 8.0 + rng.normal(0, 10.0, len(a)),
     )
 
     # Scenario 3 — Ambient+resp stressed, body still OK (early heat exposure)
     s3 = make_scenario(
         counts["amb_resp"], (30.5, 38),
         lambda a, rng: rng.uniform(38.3, 39.2, len(a)) + rng.normal(0, 0.1, len(a)),
-        lambda a, b, rng: rng.uniform(29, 60, len(a)),
+        lambda a, b, rng: rng.uniform(200, 350, len(a)),
     )
 
     # Scenario 4 — Body+resp stressed, cool ambient (fever or intense exercise indoors)
     s4 = make_scenario(
         counts["body_resp"], (20, 30),
         lambda a, rng: rng.uniform(39.6, 41.0, len(a)),
-        lambda a, b, rng: rng.uniform(29, 55, len(a)),
+        lambda a, b, rng: rng.uniform(200, 300, len(a)),
     )
 
     # Scenario 5 — Borderline: exactly one sensor stressed (label = 0)
     n_bl       = counts["borderline"]
-    bl_ambient = rng.uniform(20, 30,   n_bl)
+    bl_ambient = rng.uniform(20, 30,     n_bl)
     bl_body    = rng.uniform(38.3, 39.4, n_bl)
-    bl_resp    = rng.uniform(10, 28,   n_bl)
-    which      = rng.integers(0, 3,    n_bl)
+    bl_resp    = rng.uniform(50, 199,    n_bl)   # below 200 stress threshold
+    which      = rng.integers(0, 3,      n_bl)
     for i in range(n_bl):
         if   which[i] == 0: bl_body[i]    = rng.uniform(39.6, 41.0)
-        elif which[i] == 1: bl_resp[i]    = rng.uniform(29, 60)
+        elif which[i] == 1: bl_resp[i]    = rng.uniform(200, 300)   # resp stressed alone
         else:               bl_ambient[i] = rng.uniform(30.5, 38)
     s5 = pd.DataFrame({
         "body_temp":        np.clip(bl_body,  36.5, 41.5),
-        "respiratory_rate": np.clip(bl_resp,  5, 100),
+        "respiratory_rate": np.clip(bl_resp,  0, 400),
         "ambient_temp":     bl_ambient,
     })
 

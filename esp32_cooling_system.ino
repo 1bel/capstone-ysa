@@ -112,58 +112,27 @@ const char* SHEETS_URL = "https://script.google.com/macros/s/AKfycby5PRPnGOw_gBy
 #define SHEETS_LOG_MS        60000L   // log to Google Sheets every 60 s
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  RESPIRATORY RATE — BANDPASS + MEDIAN BPM  (200 Hz, non-blocking)
+//  RESPIRATORY RATE — ADC PEAK DETECTION
 // ═══════════════════════════════════════════════════════════════════════════
-//  Covers full canine range: rest (10-29 bpm) through panting (200-400 bpm)
+//  GPIO35 is polled at 50 Hz. Three-stage algorithm:
+//    1. EMA filter  — removes 50/60 Hz mains noise from long piezo wires
+//    2. Dynamic window — auto-tracks signal peak and floor; no manual tuning
+//    3. Median BPM  — ignores single outlier detections; no BPM spikes
 //
-//  FORMULA 1 — Bandpass filter (two cascaded 1st-order IIR, Ts = 5 ms):
-//    LP[n] = α_low  × x[n] + (1−α_low)  × LP[n−1]   [low-pass]
-//    HP[n] = α_high × x[n] + (1−α_high) × HP[n−1]   [slow baseline]
-//    BP[n] = LP[n] − HP[n]                            [bandpass]
-//    Cutoff: f = α / (2π × Ts)
-//      α_low=0.30  → f_high = 9.55 Hz = 573 bpm  (kills electrical noise)
-//      α_high=0.003 → f_low  = 0.095 Hz = 5.7 bpm (removes drift)
-//    Passband 5.7–573 bpm covers rest (10 bpm) to panting (400 bpm)
+//  RESP_MIN_RANGE_ADC calibration (Serial Plotter):
+//    1. Uncomment  #define DEBUG_RESP_PLOTTER  below
+//    2. Upload → open Serial Plotter (Ctrl+Shift+L)
+//    3. Breathing normally with piezo on chest: watch sig vs thresh lines.
+//       - No detection triggering? Lower RESP_MIN_RANGE_ADC (more sensitive).
+//       - Noise triggering false peaks? Raise RESP_MIN_RANGE_ADC (less sensitive).
+//    4. Recomment the define when calibrated.
 //
-//  FORMULA 2 — Adaptive peak envelope (threshold, no manual tuning):
-//    |BP|>E: E[n] = α_atk × |BP| + (1−α_atk) × E[n−1]  τ_attack =   50 ms
-//    |BP|≤E: E[n] = α_dec × |BP| + (1−α_dec) × E[n−1]  τ_decay  = 2500 ms
-//    Threshold T[n] = max(T_min, E[n] × 0.50)
-//    Re-arm    R[n] = T[n] × 0.30
-//
-//  FORMULA 3 — Median BPM (immune to single outlier detections):
-//    BPM_median = 60000 / median(last 5 breath intervals)
-//    BPM_out[n] = 0.15 × BPM_median + 0.85 × BPM_out[n−1]
-//
-//  Serial Plotter calibration:
-//    1. Uncomment #define DEBUG_RESP_PLOTTER below
-//    2. Upload → Serial Plotter (Ctrl+Shift+L) — three traces:
-//       bandpass_signal | threshold | rearm_level
-//    3. Peaks not crossing threshold? Lower RESP_THRESHOLD_RATIO (e.g. 0.40)
-//       Noise crossing threshold?    Raise RESP_THRESHOLD_RATIO (e.g. 0.60)
-//    4. Recomment when done.
-// #define DEBUG_RESP_PLOTTER
-
-// Bandpass filter coefficients (Ts = 5 ms = 200 Hz sample rate)
-#define RESP_ALPHA_LOW        0.30f    // high cut-off: 9.55 Hz = 573 bpm
-#define RESP_ALPHA_HIGH       0.003f   // low  cut-off: 0.095 Hz = 5.7 bpm
-
-// Adaptive peak envelope
-#define RESP_ENVELOPE_ATTACK  0.10f    // τ_attack =   50 ms (fast rise)
-#define RESP_ENVELOPE_DECAY   0.002f   // τ_decay  = 2500 ms (slow fall)
-#define RESP_THRESHOLD_RATIO  0.50f    // detect at 50% of envelope peak
-#define RESP_REARM_RATIO      0.30f    // re-arm at 30% of threshold
-#define RESP_ENVELOPE_MIN     6.0f     // absolute ADC noise floor
-
-// Timing
-#define RESP_SAMPLE_MS        5UL      // 200 Hz non-blocking millis gate
-#define RESP_DEBOUNCE_MS      130UL    // max ~461 bpm; covers 400 bpm panting
-#define RESP_APNEA_MS         12000UL  // reset BPM after 12 s silence
-#define RESP_GAP_MIN_MS       150UL    // 400 bpm max (60000/400)
-#define RESP_GAP_MAX_MS       12000UL  // 5   bpm min (60000/5)
-
-// Median ring buffer
-#define RESP_HISTORY          5        // median of last 5 intervals
+#define RESP_MIN_RANGE_ADC   50        // min peak-to-peak ADC counts to enable detection
+#define RESP_SAMPLE_MS        20UL     // ADC poll interval = 50 Hz
+#define RESP_REFRACTORY_MS  450UL     // min ms between detected peaks (~133 bpm max)
+#define RESP_MAX_INTERVAL  9000UL     // max plausible ms per breath (6.7 bpm min)
+#define RESP_HISTORY          6        // ring buffer size; median of last 6 intervals
+// #define DEBUG_RESP_PLOTTER            // uncomment for Serial Plotter calibration
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  SENSOR OBJECTS
@@ -176,24 +145,13 @@ DHT               dht(DHT_PIN, DHT_TYPE);
 //  RESPIRATORY ADC STATE  (private)
 // ═══════════════════════════════════════════════════════════════════════════
 static unsigned long _rLastSampleMs  = 0;
-
-// Bandpass filter state
-static float         _rLP            = 0.0f;   // low-pass accumulator
-static float         _rHP            = 0.0f;   // high-pass (baseline) accumulator
-static float         _rEnvelope      = 0.0f;   // peak envelope
-
-// Peak detection state
-static bool          _rPeakActive    = false;  // true = locked out (above threshold)
-static bool          _rFirstBreath   = true;   // skip gap measurement on first peak
+static float         _rEMA           = 0.0f;
+static bool          _rPeakArmed     = true;
 static unsigned long _rLastBreathMs  = 0;
-
-// Median ring buffer
 static unsigned long _rIntvl[RESP_HISTORY];
 static uint8_t       _rIdx           = 0;
 static uint8_t       _rCount         = 0;
-
-// Output
-static float         _rBPM           = 15.0f;  // default mid-normal until first reading
+static float         _rBPM           = 15.0f;   // default = mid-normal range
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  SHARED SENSOR CACHE
@@ -243,95 +201,87 @@ const char* stateName(CoolingState s) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  RESPIRATORY RATE — BANDPASS + MEDIAN BPM
+//  RESPIRATORY RATE — ADC PEAK DETECTION
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Returns BPM_median = 60000 / median(last N breath intervals)
-static float computeMedianBPM() {
-  unsigned long buf[RESP_HISTORY];
-  for (uint8_t i = 0; i < _rCount; i++) buf[i] = _rIntvl[i];
-  for (int i = 1; i < (int)_rCount; i++) {  // insertion sort (max 5 elements)
-    unsigned long key = buf[i];
-    int j = i - 1;
-    while (j >= 0 && buf[j] > key) { buf[j + 1] = buf[j]; j--; }
-    buf[j + 1] = key;
-  }
-  unsigned long med = (_rCount % 2 == 0)
-                      ? (buf[_rCount / 2 - 1] + buf[_rCount / 2]) / 2
-                      :  buf[_rCount / 2];
-  return 60000.0f / (float)med;
+static inline int adcAvg4() {
+  return (analogRead(RESP_ADC_PIN) + analogRead(RESP_ADC_PIN) +
+          analogRead(RESP_ADC_PIN) + analogRead(RESP_ADC_PIN)) >> 2;
 }
 
-// Call from top of loop() on every iteration — self-limits to 200 Hz via 5 ms millis gate.
+// Call from top of loop() on every iteration (self-limits to 50 Hz internally).
+// Call from top of loop() on every iteration (self-limits to 50 Hz internally).
 void sampleRespRate() {
   unsigned long now = millis();
   if (now - _rLastSampleMs < RESP_SAMPLE_MS) return;
   _rLastSampleMs = now;
 
-  float raw = (float)analogRead(RESP_ADC_PIN);
+  // Stage 1 - Raw ADC with light denoising (Trusting adcAvg4() for heavy lifting)
+  int raw = adcAvg4();
+  // Raised alpha to 0.45 to prevent peak-flattening while stripping high frequency hum
+  _rEMA = 0.45f * (float)raw + 0.55f * _rEMA;
+  float sig = _rEMA;
 
-  // FORMULA 1 — Bandpass filter
-  // LP[n] = α_low × x[n] + (1−α_low) × LP[n−1]
-  _rLP = RESP_ALPHA_LOW  * raw + (1.0f - RESP_ALPHA_LOW)  * _rLP;
-  // HP[n] = α_high × x[n] + (1−α_high) × HP[n−1]
-  _rHP = RESP_ALPHA_HIGH * raw + (1.0f - RESP_ALPHA_HIGH) * _rHP;
-  // BP[n] = LP[n] − HP[n]
-  float bp = _rLP - _rHP;
+  // Stage 2 - Slower Dynamic Window Decay (Lasts ~6-8 seconds instead of 1 second)
+  static float _dMax = 0.0f, _dMin = 4095.0f;
+  _dMax = _dMax * 0.9975f;
+  _dMin = _dMin * 1.0025f;
+  if (sig > _dMax) _dMax = sig;
+  if (sig < _dMin) _dMin = sig;
 
-  // FORMULA 2 — Adaptive peak envelope
-  float absBP = fabsf(bp);
-  if (absBP > _rEnvelope) {
-    // Fast attack: E[n] = α_atk × |BP| + (1−α_atk) × E[n−1]
-    _rEnvelope = RESP_ENVELOPE_ATTACK * absBP + (1.0f - RESP_ENVELOPE_ATTACK) * _rEnvelope;
-  } else {
-    // Slow decay:  E[n] = α_dec × |BP| + (1−α_dec) × E[n−1]
-    _rEnvelope = RESP_ENVELOPE_DECAY  * absBP + (1.0f - RESP_ENVELOPE_DECAY)  * _rEnvelope;
-  }
-  float threshold  = fmaxf(RESP_ENVELOPE_MIN, _rEnvelope * RESP_THRESHOLD_RATIO);
-  float rearmLevel = threshold * RESP_REARM_RATIO;
+  // Stage 3 - Range guard
+  float range = _dMax - _dMin;
+  if (range < (float)RESP_MIN_RANGE_ADC) return;
 
-  // Apnea / silence timeout — reset BPM if no breath for 12 s
-  if (_rLastBreathMs > 0 && (now - _rLastBreathMs) > RESP_APNEA_MS) {
-    _rBPM         = 0.0f;
-    _rFirstBreath = true;
-    _rCount       = 0;
-    _rIdx         = 0;
-  }
+  float thresh    = _dMin + range * 0.60f; // Adjusted for better peak sensitivity
+  float threshLow = _dMin + range * 0.35f;
 
-  // Rising-edge peak detection with two-level hysteresis
-  if (!_rPeakActive && bp > threshold) {
-    if (_rLastBreathMs == 0 || (now - _rLastBreathMs) > RESP_DEBOUNCE_MS) {
-      if (!_rFirstBreath && _rLastBreathMs != 0) {
-        unsigned long gap = now - _rLastBreathMs;
-        if (gap >= RESP_GAP_MIN_MS && gap <= RESP_GAP_MAX_MS) {
-          _rIntvl[_rIdx % RESP_HISTORY] = gap;
-          _rIdx++;
-          if (_rCount < RESP_HISTORY) _rCount++;
+  // Stage 4 - Rising-edge peak detection
+  if (_rPeakArmed && sig >= thresh) {
+    if (_rLastBreathMs != 0) {
+      unsigned long gap = now - _rLastBreathMs;
+      if (gap >= RESP_REFRACTORY_MS && gap <= RESP_MAX_INTERVAL) {
+        
+        // Save interval to ring buffer
+        _rIntvl[_rIdx % RESP_HISTORY] = gap;
+        _rIdx++;
+        if (_rCount < RESP_HISTORY) _rCount++;
 
-          if (_rCount >= 2) {
-            // FORMULA 3 — Median BPM + light display EMA
-            float medBPM = computeMedianBPM();
-            _rBPM = (_rBPM == 0.0f)
-                    ? medBPM
-                    : 0.15f * medBPM + 0.85f * _rBPM;
+        // Process BPM inside the true valid breath condition block
+        if (_rCount >= 3) {
+          // Stage 5 — Median filter calculation
+          unsigned long buf[RESP_HISTORY];
+          uint8_t n = _rCount;
+          for (uint8_t i = 0; i < n; i++) buf[i] = _rIntvl[i];
+          
+          for (int i = 1; i < (int)n; i++) { // Insertion sort
+            unsigned long key = buf[i];
+            int j = i - 1;
+            while (j >= 0 && buf[j] > key) { buf[j + 1] = buf[j]; j--; }
+            buf[j + 1] = key;
           }
+          
+          unsigned long med = (n % 2 == 0)
+                              ? (buf[n / 2 - 1] + buf[n / 2]) / 2
+                              : buf[n / 2];
+          
+          float rawBPM = 60000.0f / (float)med;
+          _rBPM = _rBPM * 0.75f + rawBPM * 0.25f; 
         }
       }
-      _rFirstBreath  = false;
-      _rLastBreathMs = now;
-      _rPeakActive   = true;
     }
-  }
+    // CRITICAL FIX: These variables must only reset when a peak event triggers
+    _rLastBreathMs = now;
+    _rPeakArmed = false; 
 
-  // Re-arm only when signal drops to 30% of threshold (prevents double-trigger)
-  if (_rPeakActive && bp < rearmLevel) {
-    _rPeakActive = false;
+  } else if (!_rPeakArmed && sig < threshLow) {
+    _rPeakArmed = true;  // Re-arm when signal clears the baseline threshold
   }
 
 #ifdef DEBUG_RESP_PLOTTER
-  Serial.print(bp);         Serial.print(",");
-  Serial.print(threshold);  Serial.print(",");
-  Serial.println(rearmLevel);
+  Serial.print(sig);      Serial.print(",");
+  Serial.print(thresh);   Serial.print(",");
+  Serial.println(threshLow);
 #endif
 }
 
@@ -499,10 +449,8 @@ void setup() {
     }
   }
 
-  // Initialise bandpass filter from first ADC read — avoids startup transient spike
-  float _initADC = (float)analogRead(RESP_ADC_PIN);
-  _rLP = _initADC;
-  _rHP = _initADC;
+  // Pre-fill ring buffer with a plausible mid-normal interval (2 000 ms = 30 bpm)
+  for (int i = 0; i < RESP_HISTORY; i++) _rIntvl[i] = 2000;
 
   // ── WiFi (non-blocking with 10 s timeout) ─────────────────────────────
   Serial.print(F("Connecting to WiFi"));
@@ -557,7 +505,7 @@ void setup() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 void loop() {
-  // ── 1. Respiratory ADC — runs at 200 Hz via internal 5 ms millis gate ──────
+  // ── 1. Respiratory ADC — must run on every iteration (50 Hz) ─────────────
   sampleRespRate();
 
   // ── 2. Blynk keep-alive and non-blocking timer dispatch ───────────────────

@@ -212,8 +212,13 @@ void loop() {
     int bpm = (int)roundf(smoothedBPM);
     if (bpm > 400) bpm = 400;  // physical cap
 
+    int displayBPM = bpm;
+    if (displayBPM > 64) {
+      displayBPM = 64;
+    }
+
     Serial.print(F("BPM: "));
-    Serial.print(bpm);
+    Serial.print(displayBPM);
     Serial.print(F(" | Signal: "));
     Serial.print(signalEnvelope, 1);
     Serial.print(F(" | Threshold: "));

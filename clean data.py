@@ -84,6 +84,9 @@ for idx, row in df_raw.iterrows():
     elif 'calli' in val_str:
         current_dog = "calli#2"
         continue
+    elif 'koba' in val_str:
+        current_dog = "koba#3"
+        continue
     
     # Skip empty lines or unparsed meta lines
     if pd.isna(row['timestamp']) or val_str == 'nan':

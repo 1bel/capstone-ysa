@@ -421,7 +421,7 @@ void TelemetryWorker(void * pvParameters) {
                       + "\"bt\":"    + String(dataSnapshot.bodyTemp, 2) + ","
                       + "\"rr\":"    + String(dataSnapshot.respRate, 1) + ","
                       + "\"at\":"    + String(dataSnapshot.envTemp, 2) + ","
-                      + "\"pred\":"  + Sstring(dataSnapshot.prediction) + ","
+                      + "\"pred\":"  + String(dataSnapshot.prediction) + ","
                       + "\"state\":" + String(dataSnapshot.coolingState) + "}";
                       
         WiFiClientSecure client;
